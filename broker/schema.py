@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 class TaskStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    RETRYING = "retrying"
     SUCCESS = "success"
     FAILED = "failed"
 
@@ -20,6 +21,8 @@ class TaskSubmission(BaseModel):
 
     task_type: str = Field(..., description="Name of the registered handler to run")
     payload: dict[str, Any] = Field(default_factory=dict)
+    priority: int = Field(default=0, description="Higher runs first; ties broken FIFO")
+    max_retries: int = Field(default=3, description="Retries allowed before FAILED is terminal")
 
 
 class Task(BaseModel):
@@ -28,13 +31,21 @@ class Task(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     task_type: str
     payload: dict[str, Any] = Field(default_factory=dict)
+    priority: int = 0
+    max_retries: int = 3
     status: TaskStatus = TaskStatus.PENDING
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     retry_count: int = 0
+    next_retry_at: Optional[datetime] = None
     result: Optional[Any] = None
     error: Optional[str] = None
 
     @classmethod
     def from_submission(cls, submission: TaskSubmission) -> "Task":
-        return cls(task_type=submission.task_type, payload=submission.payload)
+        return cls(
+            task_type=submission.task_type,
+            payload=submission.payload,
+            priority=submission.priority,
+            max_retries=submission.max_retries,
+        )
