@@ -23,6 +23,11 @@ class TaskSubmission(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     priority: int = Field(default=0, description="Higher runs first; ties broken FIFO")
     max_retries: int = Field(default=3, description="Retries allowed before FAILED is terminal")
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        description="Optional client-supplied key; resubmitting the same key "
+        "returns the existing task instead of creating a duplicate",
+    )
 
 
 class Task(BaseModel):
@@ -40,12 +45,19 @@ class Task(BaseModel):
     next_retry_at: Optional[datetime] = None
     result: Optional[Any] = None
     error: Optional[str] = None
+    # Every task has one, client-supplied or auto-generated. It's the unit
+    # of dedup for both submission (see TaskStore.enqueue) and execution
+    # (see TaskStore.get_idempotent_result / worker._execute).
+    idempotency_key: str = Field(default_factory=lambda: str(uuid.uuid4()))
 
     @classmethod
     def from_submission(cls, submission: TaskSubmission) -> "Task":
-        return cls(
+        kwargs: dict[str, Any] = dict(
             task_type=submission.task_type,
             payload=submission.payload,
             priority=submission.priority,
             max_retries=submission.max_retries,
         )
+        if submission.idempotency_key:
+            kwargs["idempotency_key"] = submission.idempotency_key
+        return cls(**kwargs)
