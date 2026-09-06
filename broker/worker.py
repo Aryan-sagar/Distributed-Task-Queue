@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from .backoff import compute_backoff_seconds
 from .registry import get_handler
 from .schema import Task, TaskStatus
 from .storage import TaskStore
@@ -48,8 +49,25 @@ class Worker:
 
         handler = get_handler(task.task_type)
         if handler is None:
+            # Not retryable — a missing handler is a config problem that
+            # won't fix itself on the next attempt. Still goes to the DLQ
+            # so an operator can see it and replay once the handler exists.
             task.status = TaskStatus.FAILED
             task.error = f"No handler registered for task_type={task.task_type!r}"
+            task.updated_at = datetime.now(timezone.utc)
+            self.store.move_to_dlq(task)
+            self.current_task_id = None
+            return
+
+        # Idempotency check: if this exact unit of work already completed
+        # successfully — e.g. this task is being processed a second time
+        # because it was replayed from the DLQ after it had actually
+        # already succeeded — don't run the handler's side effect again.
+        # Just report the cached outcome.
+        cached_result = self.store.get_idempotent_result(task.idempotency_key)
+        if cached_result is not None:
+            task.status = TaskStatus.SUCCESS
+            task.result = cached_result
             task.updated_at = datetime.now(timezone.utc)
             self.store.update(task)
             self.current_task_id = None
@@ -62,13 +80,40 @@ class Worker:
         try:
             result = handler(task.payload)
         except Exception as exc:  # noqa: BLE001 — any handler failure lands here
-            task.status = TaskStatus.FAILED
-            task.error = str(exc)
-            logger.exception("Task %s failed", task.id)
+            logger.exception("Task %s raised during execution", task.id)
+            self._handle_failure(task, exc)
         else:
             task.status = TaskStatus.SUCCESS
             task.result = result
+            task.updated_at = datetime.now(timezone.utc)
+            self.store.update(task)
+            self.store.record_idempotent_result(task.idempotency_key, result)
 
-        task.updated_at = datetime.now(timezone.utc)
-        self.store.update(task)
         self.current_task_id = None
+
+    def _handle_failure(self, task: Task, exc: Exception) -> None:
+        task.error = str(exc)
+        task.updated_at = datetime.now(timezone.utc)
+
+        if task.retry_count < task.max_retries:
+            task.retry_count += 1
+            delay = compute_backoff_seconds(task.retry_count)
+            task.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            task.status = TaskStatus.RETRYING
+            self.store.schedule_retry(task)
+            logger.warning(
+                "Task %s failed (attempt %s/%s), retrying in %.1fs",
+                task.id,
+                task.retry_count,
+                task.max_retries,
+                delay,
+            )
+        else:
+            task.status = TaskStatus.FAILED
+            self.store.move_to_dlq(task)
+            logger.error(
+                "Task %s permanently failed after %s retries, moved to DLQ",
+                task.id,
+                task.retry_count,
+            )
+
