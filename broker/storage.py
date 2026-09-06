@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import redis
 
@@ -12,10 +13,16 @@ DELAYED_KEY = "broker:queue:delayed"
 DLQ_KEY = "broker:queue:dlq"
 SEQUENCE_KEY = "broker:queue:sequence"
 TASK_KEY_PREFIX = "broker:task:"
+IDEMPOTENCY_SUBMISSION_PREFIX = "broker:idempotency:submission:"
+IDEMPOTENCY_RESULT_PREFIX = "broker:idempotency:result:"
 
 # Zero-padded wide enough that lexicographic order matches numeric order
 # for any realistic task volume.
 SEQUENCE_WIDTH = 20
+
+# How long a completed idempotency result stays cached. Bounded rather
+# than forever, since an unbounded dedup store would grow without limit.
+IDEMPOTENCY_RESULT_TTL_SECONDS = 24 * 60 * 60
 
 
 class TaskStore:
@@ -34,11 +41,33 @@ class TaskStore:
         # task ids (uuid4) never contain ':', so split once from the left.
         return member.split(":", 1)[1]
 
-    def enqueue(self, task: Task) -> None:
+    def enqueue(self, task: Task) -> Task:
+        """Add a task to the pending queue and return the task actually
+        stored — which may be an existing task, not the one passed in.
+
+        If task.idempotency_key is already claimed by a different task id,
+        that existing task is returned unchanged and nothing new is
+        enqueued. The claim itself is a Redis SETNX, so two submissions
+        racing on the same idempotency_key can't both win.
+        """
+        if task.idempotency_key:
+            idem_key = f"{IDEMPOTENCY_SUBMISSION_PREFIX}{task.idempotency_key}"
+            claimed = self.redis.set(idem_key, task.id, nx=True)
+            if not claimed:
+                existing_task_id = self.redis.get(idem_key)
+                if existing_task_id and existing_task_id != task.id:
+                    existing = self.get(existing_task_id)
+                    if existing is not None:
+                        return existing
+                # else: this task_id already owns the key (a retry,
+                # promotion, or replay of the same task) — fall through
+                # and enqueue it normally.
+
         self.redis.set(self._task_key(task.id), task.model_dump_json())
         sequence = self.redis.incr(SEQUENCE_KEY)
         member = self._member(sequence, task.id)
         self.redis.zadd(QUEUE_KEY, {member: -task.priority})
+        return task
 
     def dequeue(self) -> Optional[Task]:
         popped = self.redis.zpopmin(QUEUE_KEY, count=1)
@@ -128,4 +157,28 @@ class TaskStore:
         task.next_retry_at = None
         self.enqueue(task)
         return task
+
+    def get_idempotent_result(self, idempotency_key: str) -> Optional[Any]:
+        """Return the cached result of a previously completed task with
+        this idempotency_key, or None if nothing has completed under it
+        yet (or the cache has since expired)."""
+        raw = self.redis.get(f"{IDEMPOTENCY_RESULT_PREFIX}{idempotency_key}")
+        if raw is None:
+            return None
+        return json.loads(raw)
+
+    def record_idempotent_result(
+        self,
+        idempotency_key: str,
+        result: Any,
+        ttl_seconds: int = IDEMPOTENCY_RESULT_TTL_SECONDS,
+    ) -> None:
+        """Cache a successful result under its idempotency_key so a future
+        redelivery of the same unit of work can skip re-running the
+        handler entirely."""
+        self.redis.set(
+            f"{IDEMPOTENCY_RESULT_PREFIX}{idempotency_key}",
+            json.dumps(result),
+            ex=ttl_seconds,
+        )
 
