@@ -17,6 +17,10 @@ class WorkerPool:
 
     def start(self) -> None:
         for worker in self.workers:
+            # Registered up front (not just heartbeated) so the dashboard
+            # can list every worker immediately, even in the gap before
+            # its first status heartbeat lands.
+            self.store.register_worker(worker.worker_id)
             thread = threading.Thread(target=worker.run, daemon=True, name=worker.worker_id)
             thread.start()
             self._threads.append(thread)
