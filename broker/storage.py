@@ -15,6 +15,8 @@ SEQUENCE_KEY = "broker:queue:sequence"
 TASK_KEY_PREFIX = "broker:task:"
 IDEMPOTENCY_SUBMISSION_PREFIX = "broker:idempotency:submission:"
 IDEMPOTENCY_RESULT_PREFIX = "broker:idempotency:result:"
+WORKER_REGISTRY_KEY = "broker:worker:registry"
+WORKER_STATUS_PREFIX = "broker:worker:status:"
 
 # Zero-padded wide enough that lexicographic order matches numeric order
 # for any realistic task volume.
@@ -23,6 +25,16 @@ SEQUENCE_WIDTH = 20
 # How long a completed idempotency result stays cached. Bounded rather
 # than forever, since an unbounded dedup store would grow without limit.
 IDEMPOTENCY_RESULT_TTL_SECONDS = 24 * 60 * 60
+
+# A worker's status key expires if it doesn't heartbeat within this
+# window, so a crashed worker ages out to "unknown" on the dashboard
+# instead of showing stale data forever. Generous relative to the idle
+# poll interval, but note this is still a known simplification: a single
+# handler call running longer than this without finishing will show as
+# "unknown" between heartbeats, since Phase 7 only publishes a heartbeat
+# on status *transitions* (idle<->busy), not on a fixed timer independent
+# of task duration.
+WORKER_STATUS_TTL_SECONDS = 15
 
 
 class TaskStore:
@@ -181,4 +193,52 @@ class TaskStore:
             json.dumps(result),
             ex=ttl_seconds,
         )
+
+    def register_worker(self, worker_id: str) -> None:
+        """Record a worker id in the known-workers registry so the
+        dashboard can show it even before its first heartbeat lands (or
+        report it as unresponsive if its heartbeat later expires)."""
+        self.redis.sadd(WORKER_REGISTRY_KEY, worker_id)
+
+    def publish_worker_status(
+        self, worker_id: str, status: str, current_task_id: Optional[str]
+    ) -> None:
+        """Worker self-reports its status into Redis with a TTL.
+
+        This exists because the API process never has direct access to
+        Worker objects — they live in the separate worker-pool process
+        (see worker_main.py) and only share Redis. The TTL means a worker
+        that stops heartbeating ages out to "unknown" instead of the
+        dashboard showing stale status forever.
+        """
+        payload = json.dumps(
+            {
+                "status": status,
+                "current_task_id": current_task_id,
+                "updated_at": time.time(),
+            }
+        )
+        self.redis.set(
+            f"{WORKER_STATUS_PREFIX}{worker_id}", payload, ex=WORKER_STATUS_TTL_SECONDS
+        )
+
+    def list_worker_statuses(self) -> List[dict]:
+        worker_ids = sorted(self.redis.smembers(WORKER_REGISTRY_KEY))
+        statuses = []
+        for worker_id in worker_ids:
+            raw = self.redis.get(f"{WORKER_STATUS_PREFIX}{worker_id}")
+            if raw is None:
+                statuses.append(
+                    {"worker_id": worker_id, "status": "unknown", "current_task_id": None}
+                )
+                continue
+            data = json.loads(raw)
+            statuses.append(
+                {
+                    "worker_id": worker_id,
+                    "status": data["status"],
+                    "current_task_id": data.get("current_task_id"),
+                }
+            )
+        return statuses
 
