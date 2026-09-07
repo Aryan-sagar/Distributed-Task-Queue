@@ -33,10 +33,12 @@ class Worker:
             task = self.store.dequeue()
             if task is None:
                 self.status = "idle"
+                self.store.publish_worker_status(self.worker_id, self.status, None)
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
             self._execute(task)
         self.status = "stopped"
+        self.store.publish_worker_status(self.worker_id, self.status, None)
 
     def _execute(self, task: Task) -> None:
         """Run a single task to completion and persist the result.
@@ -46,6 +48,7 @@ class Worker:
         """
         self.status = "busy"
         self.current_task_id = task.id
+        self.store.publish_worker_status(self.worker_id, self.status, task.id)
 
         handler = get_handler(task.task_type)
         if handler is None:
