@@ -215,3 +215,49 @@ def test_published_status_is_reflected_and_ordered_by_worker_id():
         {"worker_id": "worker-0", "status": "busy", "current_task_id": "task-abc"},
         {"worker_id": "worker-1", "status": "idle", "current_task_id": None},
     ]
+
+
+def test_mark_inflight_with_active_lease_is_not_stalled():
+    store = make_store()
+    store.mark_inflight("task-1", "worker-0", lease_seconds=30)
+    assert store.list_stalled_task_ids() == []
+
+
+def test_expired_lease_reports_task_as_stalled():
+    store = make_store()
+    store.mark_inflight("task-1", "worker-0", lease_seconds=30)
+    # Simulate the lease naturally expiring, without waiting 30s for real.
+    store.redis.delete("broker:lease:task-1")
+    assert store.list_stalled_task_ids() == ["task-1"]
+
+
+def test_clear_inflight_removes_from_stalled_candidates():
+    store = make_store()
+    store.mark_inflight("task-1", "worker-0", lease_seconds=30)
+    store.clear_inflight("task-1")
+    assert store.list_stalled_task_ids() == []
+
+
+def test_claim_stalled_task_is_exclusive():
+    store = make_store()
+    store.mark_inflight("task-1", "worker-0", lease_seconds=30)
+    store.redis.delete("broker:lease:task-1")
+
+    assert store.claim_stalled_task("task-1") is True
+    assert store.claim_stalled_task("task-1") is False  # already claimed
+
+
+def test_renew_lease_only_succeeds_for_current_holder():
+    store = make_store()
+    store.mark_inflight("task-1", "worker-0", lease_seconds=30)
+
+    assert store.renew_lease("task-1", "worker-0", lease_seconds=30) is True
+    assert store.renew_lease("task-1", "worker-9", lease_seconds=30) is False
+
+
+def test_renew_lease_fails_once_lease_is_gone():
+    store = make_store()
+    store.mark_inflight("task-1", "worker-0", lease_seconds=30)
+    store.redis.delete("broker:lease:task-1")
+
+    assert store.renew_lease("task-1", "worker-0", lease_seconds=30) is False

@@ -42,6 +42,61 @@ def test_worker_executes_registered_handler_and_marks_success():
     assert calls == [{"name": "Aryan"}]
 
 
+def test_worker_clears_lease_and_inflight_marker_on_success():
+    @register("quick")
+    def handle_quick(payload):
+        return "done"
+
+    store = make_store()
+    task = Task.from_submission(TaskSubmission(task_type="quick"))
+    store.enqueue(task)
+
+    worker = Worker(worker_id="w1", store=store)
+    worker._execute(store.dequeue())
+
+    # A successfully completed task should leave no lease/in-flight trace
+    # behind — otherwise it would eventually look "stalled" to the reaper.
+    assert store.list_stalled_task_ids() == []
+
+
+def test_worker_holds_lease_during_execution():
+    lease_holder_during_call = {}
+
+    @register("check_lease")
+    def handle_check_lease(payload):
+        # Confirms mark_inflight() ran *before* the handler was invoked,
+        # not just eventually.
+        lease_holder_during_call["value"] = store.redis.get("broker:lease:" + task.id)
+        return "ok"
+
+    store = make_store()
+    task = Task.from_submission(TaskSubmission(task_type="check_lease"))
+    store.enqueue(task)
+
+    worker = Worker(worker_id="w1", store=store)
+    worker._execute(store.dequeue())
+
+    assert lease_holder_during_call["value"] == "w1"
+    # And cleared again afterwards.
+    assert store.redis.get("broker:lease:" + task.id) is None
+
+
+def test_worker_clears_lease_even_when_handler_raises():
+    @register("boom_with_lease")
+    def handle_boom_with_lease(payload):
+        raise RuntimeError("nope")
+
+    store = make_store()
+    task = Task.from_submission(TaskSubmission(task_type="boom_with_lease", max_retries=0))
+    store.enqueue(task)
+
+    worker = Worker(worker_id="w1", store=store)
+    worker._execute(store.dequeue())
+
+    assert store.list_stalled_task_ids() == []
+    assert store.dlq_count() == 1
+
+
 def test_worker_marks_failed_on_handler_exception_when_no_retries_allowed():
     @register("boom")
     def handle_boom(payload):
