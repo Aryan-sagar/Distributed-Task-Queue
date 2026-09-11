@@ -23,6 +23,11 @@ class TaskSubmission(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     priority: int = Field(default=0, description="Higher runs first; ties broken FIFO")
     max_retries: int = Field(default=3, description="Retries allowed before FAILED is terminal")
+    lease_seconds: int = Field(
+        default=30,
+        description="Max expected handler duration; a worker that stops "
+        "renewing this task's lease within this window is presumed crashed",
+    )
     idempotency_key: Optional[str] = Field(
         default=None,
         description="Optional client-supplied key; resubmitting the same key "
@@ -38,6 +43,7 @@ class Task(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     priority: int = 0
     max_retries: int = 3
+    lease_seconds: int = 30
     status: TaskStatus = TaskStatus.PENDING
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -57,6 +63,7 @@ class Task(BaseModel):
             payload=submission.payload,
             priority=submission.priority,
             max_retries=submission.max_retries,
+            lease_seconds=submission.lease_seconds,
         )
         if submission.idempotency_key:
             kwargs["idempotency_key"] = submission.idempotency_key
