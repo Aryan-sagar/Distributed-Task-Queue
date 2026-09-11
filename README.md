@@ -5,39 +5,52 @@ Celery/RQ) to understand what one actually has to solve: durable task
 storage, worker coordination, priority scheduling, failure handling, and
 observability.
 
-## Status: Phase 5 of 8 — Dead-letter queue
+## Status: Phase 7 of 8 — Live WebSocket dashboard, plus lease-based crash recovery
 
 What exists right now:
 - `POST /tasks` — submit a task (`task_type`, JSON `payload`, optional
-  `priority` and `max_retries`, defaulting to `0` and `3`).
+  `priority`, `max_retries`, `lease_seconds`, `idempotency_key`).
 - `GET /tasks/{id}` — fetch a task's current record.
 - `GET /queue/depth` — number of tasks currently waiting.
-- `GET /dlq` — list tasks currently in the dead-letter queue (optional
-  `limit` query param, default 100).
-- `GET /dlq/count` — DLQ size.
-- `POST /dlq/{id}/replay` — reset a DLQ'd task (retry_count → 0, error
-  cleared) and put it back on the pending queue at its normal priority.
-  404 if the id isn't in the DLQ.
-- The pending queue is a Redis sorted set scored by priority, with FIFO
-  tie-break via a monotonic sequence encoded in the member string.
-  `broker/heap.py` has the standalone, unit-tested `MinHeap` demonstrating
-  the same ordering logic in isolation.
-- A delayed ZSET holds tasks with retries remaining, scored by
-  `next_retry_at`; `broker/scheduler.py`'s `RetryScheduler` polls it and
-  promotes due tasks back onto the pending queue. Backoff is full-jitter
-  exponential (`broker/backoff.py`).
-- A DLQ set (`broker/storage.py`'s `move_to_dlq`/`list_dlq`/`replay`)
-  indexes any task that becomes terminally `FAILED` — whether from
-  exhausting its retries or from an unrecoverable error like a missing
-  handler. Either way, a human needs to look at it, which is what the DLQ
-  is for.
-- `broker/worker.py` routes both terminal-failure paths through
-  `move_to_dlq` instead of a plain status update.
-- `worker_main.py` runs the worker pool and retry scheduler side by side
-  as one process.
+- `GET /dlq`, `GET /dlq/count`, `POST /dlq/{id}/replay` — dead-letter
+  queue inspection and replay.
+- `GET /dashboard` — a single self-contained HTML page (no build step)
+  showing pending/retrying/dead-lettered counts and live worker status.
+- `GET /ws/dashboard` — pushes a JSON snapshot once per second, via
+  `asyncio.to_thread` so the (synchronous) Redis calls can't stall the
+  event loop for other connections.
+- **Crash recovery via leases.** A worker acquires a time-limited lease
+  (`task.lease_seconds`, default 30s) when it starts executing a task,
+  and actively renews it on a background thread for as long as the
+  handler actually runs — a static timeout doesn't work for handlers of
+  variable duration, so the lease is kept alive by renewal, not just set
+  once up front. `broker/reaper.py`'s `StalledTaskReaper` polls for tasks
+  that are still marked in-flight but whose lease has expired — meaning
+  the worker that held it crashed (or otherwise stopped renewing)
+  without ever reaching a terminal state — and recovers them through
+  `broker/failure.py`'s `handle_task_failure`, the exact same
+  retry-vs-DLQ decision a normal handler exception goes through. This
+  closes a gap flagged (and left open) since Phase 4: at-least-once
+  delivery previously only covered *handler exceptions*, not a worker
+  process dying mid-handler.
+- Worker status is a heartbeat published into Redis with a TTL — the API
+  and worker pool are separate processes and share nothing but Redis, so
+  a worker that stops heartbeating ages out to `"unknown"` on the
+  dashboard.
+- The pending queue is a Redis sorted set scored by priority
+  (`broker/storage.py`), with `broker/heap.py`'s standalone `MinHeap`
+  demonstrating the ordering logic in isolation.
+- Retries use full-jitter exponential backoff via a delayed ZSET and
+  `broker/scheduler.py`'s `RetryScheduler`.
+- Every task carries an idempotency key; the worker checks a cached
+  result before invoking a handler, so a task processed twice — whether
+  via DLQ replay or crash recovery — can't run its side effect twice.
+- `worker_main.py` runs the worker pool, retry scheduler, and stalled-task
+  reaper together as one process.
 
-What's deliberately *not* here yet: no idempotency enforcement, no
-dashboard. Those are the last two phases.
+What's deliberately *not* here yet: Docker Compose, a full end-to-end
+test run, benchmarks, and (stretch) consistent hashing across multiple
+broker nodes. That's the last phase.
 
 ## Roadmap
 
@@ -45,8 +58,11 @@ dashboard. Those are the last two phases.
 2. ~~Worker pool & execution~~
 3. ~~Priority scheduling~~
 4. ~~Retries with exponential backoff + jitter~~
-5. ~~Dead-letter queue for permanently-failed tasks~~ (this phase)
-6. Idempotency enforcement
+5. ~~Dead-letter queue for permanently-failed tasks~~
+6. ~~Idempotency enforcement~~
+7. ~~Live WebSocket dashboard~~, ~~lease-based crash recovery~~ (this phase)
+8. Hardening — Docker Compose, benchmarks, and (stretch) consistent
+   hashing across multiple broker nodes
 4. Retries with exponential backoff + jitter
 5. Dead-letter queue for permanently-failed tasks
 6. Idempotency enforcement — dedup on an idempotency key
