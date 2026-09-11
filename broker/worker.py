@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
-from .backoff import compute_backoff_seconds
+from .failure import handle_task_failure
 from .registry import get_handler
 from .schema import Task, TaskStatus
 from .storage import TaskStore
@@ -79,44 +79,44 @@ class Worker:
         task.status = TaskStatus.RUNNING
         task.updated_at = datetime.now(timezone.utc)
         self.store.update(task)
+        self.store.mark_inflight(task.id, self.worker_id, task.lease_seconds)
+
+        lease_stop = threading.Event()
+        renewal_thread = threading.Thread(
+            target=self._renew_lease_periodically,
+            args=(task.id, task.lease_seconds, lease_stop),
+            daemon=True,
+        )
+        renewal_thread.start()
 
         try:
             result = handler(task.payload)
         except Exception as exc:  # noqa: BLE001 — any handler failure lands here
             logger.exception("Task %s raised during execution", task.id)
-            self._handle_failure(task, exc)
+            handle_task_failure(self.store, task, str(exc))
         else:
             task.status = TaskStatus.SUCCESS
             task.result = result
             task.updated_at = datetime.now(timezone.utc)
             self.store.update(task)
             self.store.record_idempotent_result(task.idempotency_key, result)
+        finally:
+            lease_stop.set()
+            renewal_thread.join(timeout=1)
+            self.store.clear_inflight(task.id)
 
         self.current_task_id = None
 
-    def _handle_failure(self, task: Task, exc: Exception) -> None:
-        task.error = str(exc)
-        task.updated_at = datetime.now(timezone.utc)
-
-        if task.retry_count < task.max_retries:
-            task.retry_count += 1
-            delay = compute_backoff_seconds(task.retry_count)
-            task.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
-            task.status = TaskStatus.RETRYING
-            self.store.schedule_retry(task)
-            logger.warning(
-                "Task %s failed (attempt %s/%s), retrying in %.1fs",
-                task.id,
-                task.retry_count,
-                task.max_retries,
-                delay,
-            )
-        else:
-            task.status = TaskStatus.FAILED
-            self.store.move_to_dlq(task)
-            logger.error(
-                "Task %s permanently failed after %s retries, moved to DLQ",
-                task.id,
-                task.retry_count,
-            )
-
+    def _renew_lease_periodically(
+        self, task_id: str, lease_seconds: int, stop_event: threading.Event
+    ) -> None:
+        """Runs on its own thread for the duration of one handler call.
+        Renews at half the lease interval, so a single missed renewal
+        (a slow Redis round-trip, say) doesn't cost the lease outright."""
+        interval = max(1.0, lease_seconds / 2)
+        while not stop_event.wait(interval):
+            renewed = self.store.renew_lease(task_id, self.worker_id, lease_seconds)
+            if not renewed:
+                # Something else (a reaper) already reclaimed this task —
+                # nothing more for this thread to do.
+                return
