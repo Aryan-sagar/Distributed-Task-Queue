@@ -17,6 +17,8 @@ IDEMPOTENCY_SUBMISSION_PREFIX = "broker:idempotency:submission:"
 IDEMPOTENCY_RESULT_PREFIX = "broker:idempotency:result:"
 WORKER_REGISTRY_KEY = "broker:worker:registry"
 WORKER_STATUS_PREFIX = "broker:worker:status:"
+INFLIGHT_KEY = "broker:queue:inflight"
+LEASE_KEY_PREFIX = "broker:lease:"
 
 # Zero-padded wide enough that lexicographic order matches numeric order
 # for any realistic task volume.
@@ -241,4 +243,54 @@ class TaskStore:
                 }
             )
         return statuses
+
+    def mark_inflight(self, task_id: str, worker_id: str, lease_seconds: int) -> None:
+        """Called when a worker starts executing a task: records it as
+        in-flight and acquires a time-limited lease. If the worker
+        crashes before ever calling clear_inflight(), the lease's TTL
+        eventually passes on its own, and StalledTaskReaper can then tell
+        this task apart from one that's still legitimately running."""
+        self.redis.sadd(INFLIGHT_KEY, task_id)
+        self.redis.set(f"{LEASE_KEY_PREFIX}{task_id}", worker_id, ex=lease_seconds)
+
+    def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> bool:
+        """Extend a lease this worker still holds. Returns False (and
+        renews nothing) if the lease has already been reclaimed by
+        someone else — e.g. a reaper decided this task was stalled and
+        recovered it while this worker was still (slowly) running it."""
+        current_holder = self.redis.get(f"{LEASE_KEY_PREFIX}{task_id}")
+        if current_holder != worker_id:
+            return False
+        self.redis.expire(f"{LEASE_KEY_PREFIX}{task_id}", lease_seconds)
+        return True
+
+    def clear_inflight(self, task_id: str) -> None:
+        """Called when a task reaches any terminal-for-this-attempt state
+        under normal operation (success, scheduled for retry, or moved to
+        the DLQ) — releasing the claim before it would otherwise be
+        needed lets a task that finishes quickly be reused/replayed
+        immediately rather than waiting out its lease."""
+        self.redis.srem(INFLIGHT_KEY, task_id)
+        self.redis.delete(f"{LEASE_KEY_PREFIX}{task_id}")
+
+    def list_stalled_task_ids(self) -> List[str]:
+        """Task ids still marked in-flight whose lease is gone — the
+        worker that was running them is presumed crashed (or otherwise
+        stopped renewing the lease) without ever reaching a terminal
+        state."""
+        stalled = []
+        for task_id in self.redis.smembers(INFLIGHT_KEY):
+            if not self.redis.exists(f"{LEASE_KEY_PREFIX}{task_id}"):
+                stalled.append(task_id)
+        return stalled
+
+    def claim_stalled_task(self, task_id: str) -> bool:
+        """Attempt to claim a stalled task for recovery. Returns True if
+        this caller claimed it (removed it from the in-flight set), False
+        if it was already claimed — e.g. by another reaper instance
+        racing on the same task, or because the original worker actually
+        finished in the gap between the lease expiring and the reaper
+        acting on it. Callers should only call this for ids already
+        identified via list_stalled_task_ids()."""
+        return bool(self.redis.srem(INFLIGHT_KEY, task_id))
 
